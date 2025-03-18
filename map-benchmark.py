@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class MapElementDB:
     def __init__(self, db_name: str = "mapdb", collection_name: str = "map_elements"):
         username = "milan"
-        password = "wAr16dk7"
+        password = "xxxx"
         host = "ping5.cluster-c7b8fns5un9o.us-east-1.docdb.amazonaws.com"
         port = 27017
 
