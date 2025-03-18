@@ -17,8 +17,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class BatchProcessor:
+    def __init__(self, batch_size=100):
+        self.batch_size = batch_size
+        self.batch = []
+        self.batch_lock = threading.Lock()
+
+    def add_and_get_batch(self, item):
+        with self.batch_lock:
+            self.batch.append(item)
+            if len(self.batch) >= self.batch_size:
+                result = self.batch
+                self.batch = []
+                return result
+        return None
+
 class ConnectionPool:
-    def __init__(self, pool_size=100):
+    def __init__(self, pool_size=500):
         self.pool_size = pool_size
         self.connections = queue.Queue(maxsize=pool_size)
         self.connection_count = 0
@@ -26,23 +41,20 @@ class ConnectionPool:
         
     def get_connection(self):
         try:
-            # Try to get an existing connection from the pool
             return self.connections.get_nowait()
         except queue.Empty:
-            # If no connection is available, create a new one if possible
             with self.lock:
                 if self.connection_count < self.pool_size:
                     conn = MapElementDB()
                     self.connection_count += 1
                     return conn
-            # If we've reached the pool size limit, wait for an available connection
             return self.connections.get()
 
     def return_connection(self, conn):
         self.connections.put(conn)
 
 class MapElementDB:
-    def __init__(self, db_name: str = "mapdb", collection_name: str = "map_elements"):
+    def __init__(self):
         username = "milan"
         password = "wAr16dk7"
         host = "ping5.cluster-c7b8fns5un9o.us-east-1.docdb.amazonaws.com"
@@ -51,23 +63,21 @@ class MapElementDB:
         self.timestamps = [
             1711105300562,
             1711005300562,
-            1710905300562,
-            1710904300562,
-            1710903300562,
-            1710902300562,
-            1710901300562,
-            1710900300562
+            1710905300562
         ]
 
         connection_string = f"mongodb://{username}:{password}@{host}:{port}/?tls=false&retryWrites=false"
         self.client = MongoClient(
             connection_string,
-            maxPoolSize=100,
-            minPoolSize=10,
-            maxIdleTimeMS=120000
+            maxPoolSize=500,
+            minPoolSize=100,
+            maxIdleTimeMS=120000,
+            connectTimeoutMS=2000,
+            serverSelectionTimeoutMS=3000,
+            waitQueueMultiple=100
         )
-        self.db = self.client[db_name]
-        self.collection = self.db[collection_name]
+        self.db = self.client.mapdb
+        self.collection = self.db.map_elements
         self._ensure_indexes()
 
     def _ensure_indexes(self):
@@ -77,13 +87,14 @@ class MapElementDB:
         except Exception as e:
             logger.warning(f"Index creation failed: {str(e)}")
 
-    def get_latest_elements(self, tile):
+    def get_latest_elements_batch(self, tiles):
+        """Process multiple tiles in a single batch operation"""
         selected_timestamp = random.choice(self.timestamps)
         
         pipeline = [
             {
                 "$match": {
-                    "tile": tile,
+                    "tile": {"$in": tiles},
                     "tsver": {"$lte": selected_timestamp}
                 }
             },
@@ -92,19 +103,15 @@ class MapElementDB:
             },
             {
                 "$group": {
-                    "_id": "$element",
+                    "_id": {
+                        "tile": "$tile",
+                        "element": "$element"
+                    },
                     "max_tsver": {"$first": "$tsver"}
-                }
-            },
-            {
-                "$project": {
-                    "element": "$_id",
-                    "max_tsver": 1,
-                    "_id": 0
                 }
             }
         ]
-        
+
         return list(self.collection.aggregate(
             pipeline,
             allowDiskUse=True,
@@ -113,11 +120,13 @@ class MapElementDB:
 
 class QueryWorker(threading.Thread):
     def __init__(self, worker_id: int, connection_pool: ConnectionPool, 
-                 query_queue: queue.Queue, results: List[Dict], duration: int):
+                 query_queue: queue.Queue, batch_processor: BatchProcessor,
+                 results: List[Dict], duration: int):
         super().__init__()
         self.worker_id = worker_id
         self.connection_pool = connection_pool
         self.query_queue = query_queue
+        self.batch_processor = batch_processor
         self.results = results
         self.duration = duration
         self.stop_flag = False
@@ -125,22 +134,27 @@ class QueryWorker(threading.Thread):
     def run(self):
         conn = self.connection_pool.get_connection()
         start_time = time.time()
-        
+        batch = []
+
         try:
             while not self.stop_flag and (time.time() - start_time) < self.duration:
                 try:
-                    # Process multiple queries in batch
-                    for _ in range(10):  # Process 10 queries per batch
-                        if self.query_queue.empty():
-                            break
-                            
+                    # Collect tiles for batch processing
+                    while len(batch) < 100:  # Process up to 100 tiles per batch
                         tile = self.query_queue.get_nowait()
-                        query_start = time.time()
-                        
-                        try:
-                            results = conn.get_latest_elements(tile)
-                            query_time = time.time() - query_start
-                            
+                        batch.append(tile)
+                except queue.Empty:
+                    if not batch:
+                        time.sleep(0.001)
+                        continue
+
+                if batch:
+                    query_start = time.time()
+                    try:
+                        results = conn.get_latest_elements_batch(batch)
+                        query_time = (time.time() - query_start) / len(batch)
+
+                        for tile in batch:
                             self.results.append({
                                 'worker_id': self.worker_id,
                                 'tile': tile,
@@ -149,23 +163,22 @@ class QueryWorker(threading.Thread):
                                 'success': True,
                                 'timestamp': time.time()
                             })
-                        except Exception as e:
-                            logger.error(f"Worker {self.worker_id} query error: {str(e)}")
+                    except Exception as e:
+                        logger.error(f"Batch query error: {str(e)}")
+                        for tile in batch:
                             self.results.append({
                                 'worker_id': self.worker_id,
                                 'tile': tile,
                                 'query_time': time.time() - query_start,
                                 'elements_count': 0,
                                 'success': False,
-                                'timestamp': time.time(),
                                 'error': str(e)
                             })
-                        finally:
+                    finally:
+                        for _ in range(len(batch)):
                             self.query_queue.task_done()
-                            
-                except queue.Empty:
-                    time.sleep(0.001)  # Short sleep when queue is empty
-                    
+                        batch.clear()
+
         finally:
             self.connection_pool.return_connection(conn)
 
@@ -175,12 +188,13 @@ class QueryWorker(threading.Thread):
 def run_benchmark(num_clients: int, duration: int) -> Dict:
     results = []
     query_queue = queue.Queue()
-    connection_pool = ConnectionPool(pool_size=min(num_clients, 100))
+    connection_pool = ConnectionPool(pool_size=min(num_clients, 500))
+    batch_processor = BatchProcessor(batch_size=100)
     
     # Create worker threads
     workers = []
     for i in range(num_clients):
-        worker = QueryWorker(i, connection_pool, query_queue, results, duration)
+        worker = QueryWorker(i, connection_pool, query_queue, batch_processor, results, duration)
         workers.append(worker)
         worker.start()
 
@@ -191,7 +205,7 @@ def run_benchmark(num_clients: int, duration: int) -> Dict:
         tile = f"tile_{tile_num}"
         query_queue.put(tile)
 
-        if (time.time() - start_time) % 1 < 0.1:  # Report progress every second
+        if (time.time() - start_time) % 1 < 0.1:
             queries_so_far = len(results)
             elapsed = time.time() - start_time
             qps = queries_so_far / elapsed if elapsed > 0 else 0
@@ -222,14 +236,18 @@ def run_benchmark(num_clients: int, duration: int) -> Dict:
     query_times = [r['query_time'] for r in results if r['success']]
     successful_queries = len([r for r in results if r['success']])
     total_elements = sum(r['elements_count'] for r in results if r['success'])
+    total_queries = len(results)
+    
+    # Calculate total QPS across all threads
+    qps = total_queries / duration  # Changed from len(results) / duration
 
     return {
         'num_clients': num_clients,
         'duration': duration,
-        'total_queries': len(results),
+        'total_queries': total_queries,
         'successful_queries': successful_queries,
         'errors': len(results) - successful_queries,
-        'qps': len(results) / duration,
+        'qps': qps,  # This now represents total QPS across all threads
         'avg_time': statistics.mean(query_times) if query_times else 0,
         'median_time': statistics.median(query_times) if query_times else 0,
         'min_time': min(query_times) if query_times else 0,
@@ -268,7 +286,6 @@ def main():
         print(f"Max query time: {result['max_time']*1000:.2f} ms")
         print(f"Total elements retrieved: {result['total_elements']}")
 
-        # Cooldown period
         print(f"\nCooling down for {cooldown} seconds...")
         time.sleep(cooldown)
 
@@ -282,6 +299,7 @@ def main():
         print(f"{r['num_clients']:7d} | {r['qps']:7.1f} | {r['avg_time']*1000:7.1f} | "
               f"{r['median_time']*1000:9.1f} | {r['min_time']*1000:7.1f} | {r['max_time']*1000:7.1f} | "
               f"{success_rate:8.1f}% | {r['total_queries']:13d}")
+    print("=" * 100)
 
 if __name__ == "__main__":
     main()
