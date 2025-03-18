@@ -1,14 +1,14 @@
 from pymongo import MongoClient, ASCENDING, DESCENDING
 import concurrent.futures
+import threading
 import random
 import time
 import logging
 import statistics
 from datetime import datetime
 from typing import List, Dict
-from queue import Queue, Empty
-from threading import Event
 
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -16,47 +16,42 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class MapElementDB:
-    _instance = None
-    _initialized = False
+    def __init__(self, db_name: str = "mapdb", collection_name: str = "map_elements"):
+        username = "milan"
+        password = "xxxx"
+        host = "ping5.cluster-c7b8fns5un9o.us-east-1.docdb.amazonaws.com"
+        port = 27017
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(MapElementDB, cls).__new__(cls)
-        return cls._instance
-
-    def __init__(self):
-        if not MapElementDB._initialized:
-            username = "milan"
-            password = "xxxx"
-            host = "ping5.cluster-c7b8fns5un9o.us-east-1.docdb.amazonaws.com"
-            port = 27017
-
-            connection_string = f"mongodb://{username}:{password}@{host}:{port}/?tls=false&retryWrites=false"
-            self.client = MongoClient(
-                connection_string,
-                maxPoolSize=100,  # Adjust based on your needs
-                minPoolSize=10,
-                maxIdleTimeMS=45000,
-                waitQueueTimeoutMS=1000
-            )
-            self.db = self.client["mapdb"]
-            self.collection = self.db["map_elements"]
-            self._ensure_indexes()
-            MapElementDB._initialized = True
+        connection_string = f"mongodb://{username}:{password}@{host}:{port}/?tls=false&retryWrites=false"
+        self.client = MongoClient(connection_string)
+        self.db = self.client[db_name]
+        self.collection = self.db[collection_name]
+        self._ensure_indexes()
 
     def _ensure_indexes(self):
+        """Create necessary indexes for optimized queries"""
         try:
             self.collection.create_index([("tile", 1), ("tsver", -1)])
             self.collection.create_index([("tile", 1), ("element", 1), ("tsver", -1)])
         except Exception as e:
             logger.warning(f"Index creation failed: {str(e)}")
 
+    def get_random_timestamp(self, tile):
+        """Get a random timestamp from existing data for a specific tile"""
+        result = self.collection.find_one(
+            {"tile": tile},
+            {"tsver": 1, "_id": 0}
+        )
+        return result["tsver"] if result else None
+
     def get_latest_elements(self, tile, max_timestamp):
+        """Get the latest version of each element"""
         pipeline = [
             {
                 "$match": {
                     "tile": tile,
-                    "tsver": {"$lte": 1711105300562}
+                    #"tsver": {"$lte": max_timestamp}
+                    "tsver": {"$lte": 1711105300562}                    
                 }
             },
             {
@@ -80,77 +75,99 @@ class MapElementDB:
         return list(self.collection.aggregate(
             pipeline,
             allowDiskUse=True,
-            hint={"tile": 1, "tsver": -1}
+            hint={"tile": 1, "tsver": -1}  # Corrected hint format
         ))
 
-def perform_query(db, tile):
-    """Execute a single query and return its execution time"""
-    start_time = time.time()
-    try:
-        results = db.get_latest_elements(tile, None)
-        query_time = time.time() - start_time
-        return {
-            'tile': tile,
-            'query_time': query_time,
-            'elements_count': len(results),
-            'success': True
-        }
-    except Exception as e:
-        return {
-            'tile': tile,
-            'query_time': time.time() - start_time,
-            'elements_count': 0,
-            'success': False,
-            'error': str(e)
-        }
+    def close(self):
+        self.client.close()
 
-def worker(result_queue: Queue, stop_event: Event):
-    """Worker function that performs queries"""
-    db = MapElementDB()
-    while not stop_event.is_set():
-        tile_num = str(random.randint(0, 1999)).zfill(4)
-        tile = f"tile_{tile_num}"
-        result = perform_query(db, tile)
-        result_queue.put(result)
+class QueryClient(threading.Thread):
+    """Client thread that continuously performs queries"""
+    def __init__(self, client_id: int, duration: int, results: List[Dict]):
+        super().__init__()
+        self.client_id = client_id
+        self.duration = duration
+        self.results = results
+        self.db_connection = MapElementDB()
+        self.stop_flag = False
 
-def run_benchmark(num_workers: int, duration: int) -> Dict:
-    """Run benchmark with specified number of workers"""
-    results = []
-    result_queue = Queue()
-    stop_event = Event()
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = [
-            executor.submit(worker, result_queue, stop_event)
-            for _ in range(num_workers)
-        ]
-
-        start_time = time.time()
-        last_progress = start_time
-
+    def run(self):
         try:
-            while time.time() - start_time < duration:
+            start_time = time.time()
+            while not self.stop_flag and (time.time() - start_time) < self.duration:
+                # Generate random tile
+                tile_num = str(random.randint(0, 1999)).zfill(4)
+                tile = f"tile_{tile_num}"
+                
+                query_start = time.time()
                 try:
-                    result = result_queue.get(timeout=0.1)
-                    results.append(result)
-
-                    current_time = time.time()
-                    if current_time - last_progress >= 1.0:
-                        elapsed = current_time - start_time
-                        qps = len(results) / elapsed
-                        logger.info(f"Progress: {elapsed:.1f}s, Queries: {len(results)}, QPS: {qps:.1f}")
-                        last_progress = current_time
-                except Empty:
-                    continue
+                    results = self.db_connection.get_latest_elements(tile, None)
+                    query_time = time.time() - query_start
+                    
+                    self.results.append({
+                        'client_id': self.client_id,
+                        'tile': tile,
+                        'query_time': query_time,
+                        'elements_count': len(results),
+                        'success': True,
+                        'timestamp': time.time()
+                    })
+                except Exception as e:
+                    logger.error(f"Client {self.client_id} query error: {str(e)}")
+                    self.results.append({
+                        'client_id': self.client_id,
+                        'tile': tile,
+                        'query_time': time.time() - query_start,
+                        'elements_count': 0,
+                        'success': False,
+                        'timestamp': time.time(),
+                        'error': str(e)
+                    })
         finally:
-            stop_event.set()
-            for future in futures:
-                future.cancel()
+            self.db_connection.close()
+
+    def stop(self):
+        self.stop_flag = True
+
+def run_benchmark(num_clients: int, duration: int) -> Dict:
+    """
+    Run benchmark with specified number of clients for given duration
+    
+    Args:
+        num_clients: Number of concurrent clients
+        duration: Test duration in seconds
+    """
+    results = []
+    clients = []
+
+    # Start clients
+    logger.info(f"Starting {num_clients} clients for {duration} seconds...")
+    for i in range(num_clients):
+        client = QueryClient(i, duration, results)
+        clients.append(client)
+        client.start()
+
+    # Monitor progress
+    start_time = time.time()
+    while time.time() - start_time < duration:
+        time.sleep(1)
+        queries_so_far = len(results)
+        elapsed = time.time() - start_time
+        qps = queries_so_far / elapsed if elapsed > 0 else 0
+        logger.info(f"Progress: {elapsed:.1f}s, Queries: {queries_so_far}, QPS: {qps:.1f}")
+
+    # Stop clients
+    for client in clients:
+        client.stop()
+
+    # Wait for clients to finish
+    for client in clients:
+        client.join()
 
     # Calculate statistics
     if not results:
         return {
-            'num_workers': num_workers,
+            'num_clients': num_clients,
             'duration': duration,
             'total_queries': 0,
             'successful_queries': 0,
@@ -166,15 +183,14 @@ def run_benchmark(num_workers: int, duration: int) -> Dict:
     query_times = [r['query_time'] for r in results if r['success']]
     successful_queries = len([r for r in results if r['success']])
     total_elements = sum(r['elements_count'] for r in results if r['success'])
-    actual_duration = time.time() - start_time
 
     return {
-        'num_workers': num_workers,
-        'duration': actual_duration,
+        'num_clients': num_clients,
+        'duration': duration,
         'total_queries': len(results),
         'successful_queries': successful_queries,
         'errors': len(results) - successful_queries,
-        'qps': len(results) / actual_duration,
+        'qps': len(results) / duration,
         'avg_time': statistics.mean(query_times) if query_times else 0,
         'median_time': statistics.median(query_times) if query_times else 0,
         'min_time': min(query_times) if query_times else 0,
@@ -184,23 +200,24 @@ def run_benchmark(num_workers: int, duration: int) -> Dict:
 
 def main():
     # Test configuration
-    worker_counts = [100, 500, 1000, 2000]  # Reduced max concurrency
-    duration = 30  # Reduced duration
-    cooldown = 5   # Reduced cooldown
+    client_counts = [100, 500, 1000, 5000, 10000, 40000]
+    duration = 60  # seconds per test
+    cooldown = 10  # seconds between tests
 
     print("\nDocumentDB Query Performance Benchmark")
     print("=" * 80)
     print(f"Start time: {datetime.now()}")
     print(f"Test duration per concurrency level: {duration} seconds")
+    print(f"Testing random tiles from tile_0000 to tile_1999")
     print("=" * 80)
 
     results = []
-    for num_workers in worker_counts:
-        print(f"\nTesting with {num_workers} concurrent workers...")
-        result = run_benchmark(num_workers, duration)
+    for num_clients in client_counts:
+        print(f"\nTesting with {num_clients} concurrent clients...")
+        result = run_benchmark(num_clients, duration)
         results.append(result)
 
-        print(f"\nResults for {num_workers} workers:")
+        print(f"\nResults for {num_clients} clients:")
         print("-" * 60)
         print(f"Total queries: {result['total_queries']}")
         print(f"Successful queries: {result['successful_queries']}")
@@ -212,18 +229,18 @@ def main():
         print(f"Max query time: {result['max_time']*1000:.2f} ms")
         print(f"Total elements retrieved: {result['total_elements']}")
 
-        if num_workers < worker_counts[-1]:
-            print(f"\nCooling down for {cooldown} seconds...")
-            time.sleep(cooldown)
+        # Cooldown period
+        print(f"\nCooling down for {cooldown} seconds...")
+        time.sleep(cooldown)
 
     # Print summary table
     print("\nBenchmark Summary")
     print("=" * 100)
-    print("Workers | QPS     | Avg(ms) | Median(ms) | Min(ms) | Max(ms) | Success % | Total Queries")
+    print("Clients | QPS     | Avg(ms) | Median(ms) | Min(ms) | Max(ms) | Success % | Total Queries")
     print("-" * 100)
     for r in results:
         success_rate = (r['successful_queries'] / r['total_queries'] * 100) if r['total_queries'] > 0 else 0
-        print(f"{r['num_workers']:7d} | {r['qps']:7.1f} | {r['avg_time']*1000:7.1f} | "
+        print(f"{r['num_clients']:7d} | {r['qps']:7.1f} | {r['avg_time']*1000:7.1f} | "
               f"{r['median_time']*1000:9.1f} | {r['min_time']*1000:7.1f} | {r['max_time']*1000:7.1f} | "
               f"{success_rate:8.1f}% | {r['total_queries']:13d}")
 
