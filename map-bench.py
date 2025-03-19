@@ -16,7 +16,6 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logging.getLogger('pymongo.topology').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 class MapElementDB:
@@ -291,7 +290,7 @@ def run_benchmark(total_clients: int, duration: int) -> Dict:
 
 def main():
     # Updated test configuration with smaller numbers
-    client_counts = [500, 1000, 5000]
+    client_counts = [20, 50, 100, 500, 1000, 5000]
     duration = 300  # Reduced duration
     cooldown = 15  # increased cooldown between tests
 
